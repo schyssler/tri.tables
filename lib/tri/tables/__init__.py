@@ -674,6 +674,50 @@ def render_table_filters(request, table):
         return filter_form
 
 
+def bulk_form_for_table(request, table):
+    bulk_fields = [x.name for x in table.columns if x.bulk]
+    if not bulk_fields:
+        return None
+
+    column_by_name = {column.name: column for column in table.columns if column.bulk}
+
+    class BulkForm(forms.ModelForm):
+        class Meta:
+            model = table.data.model
+            fields = bulk_fields
+
+        def __init__(self, *args, **kwargs):
+            super(BulkForm, self).__init__(*args, **kwargs)
+            for name, column in {k: v for k, v in column_by_name.items() if 'bulk_field' in v}.items():
+                self.fields[name] = column.bulk_field
+
+            for field_name, field in self.fields.items():
+                field.required = False
+                field.blank = True
+                field.null = True
+                if hasattr(field, 'choices'):
+                    if 'bulk_choices' in column_by_name[field_name]:
+                        choices = column_by_name[field_name].bulk_choices
+                    else:
+                        choices = field.choices
+
+                    if isinstance(choices, QuerySet):
+                        choices = [(x.pk, x) for x in choices]
+                    if ('', '') not in choices:
+                        choices = [('', '')] + list(choices)
+                    field.choices = choices
+
+        def save(self):
+            pks = [key[len('pk_'):] for key in request.POST if key.startswith('pk_')]
+            table.data \
+                .filter(pk__in=pks) \
+                .filter(**table.Meta.bulk_filter) \
+                .exclude(**table.Meta.bulk_exclude) \
+                .update(**{k: v for k, v in self.cleaned_data.items() if v is not None and v != ''})
+            return HttpResponseRedirect(request.META['HTTP_REFERER'])
+
+    return BulkForm(request.POST if request.method == 'POST' else None)
+
 def render_table(request,
                  table,
                  links=None,
@@ -685,7 +729,8 @@ def render_table(request,
                  context_processors=None,
                  paginator=None,
                  show_hits=False,
-                 hit_label='Items'):
+                 hit_label='Items',
+                 bulk_form_for_table=bulk_form_for_table):
     """
     Render a table. This automatically handles pagination, sorting, filtering and bulk operations.
 
@@ -697,6 +742,7 @@ def render_table(request,
     :param blank_on_empty: turn off the displaying of `{{ empty_message }}` in the template when the list is empty
     :param show_hits: Display how many items there are total in the paginator.
     :param hit_label: Label for the show_hits display.
+    :param bulk_form_for_table: factory function for creating a bulk edit form from table instance.
     :return: a string with the rendered HTML table
     """
     if not context:
@@ -705,53 +751,13 @@ def render_table(request,
 
     table.request = request
 
-    bulk_form = None
-    bulk_fields = [x.name for x in table.columns if x.bulk]
-    if bulk_fields:
-        column_by_name = {column.name: column for column in table.columns if column.bulk}
+    bulk_form = bulk_form_for_table(request, table)
 
-        class BulkForm(forms.ModelForm):
-            class Meta:
-                model = table.data.model
-                fields = bulk_fields
-
-            def __init__(self, *args, **kwargs):
-                super(BulkForm, self).__init__(*args, **kwargs)
-                for name, column in {k: v for k, v in column_by_name.items() if 'bulk_field' in v}.items():
-                    self.fields[name] = column.bulk_field
-
-                for field_name, field in self.fields.items():
-                    field.required = False
-                    field.blank = True
-                    field.null = True
-                    if hasattr(field, 'choices'):
-                        if 'bulk_choices' in column_by_name[field_name]:
-                            choices = column_by_name[field_name].bulk_choices
-                        else:
-                            choices = field.choices
-
-                        if isinstance(choices, QuerySet):
-                            choices = [(x.pk, x) for x in choices]
-                        if ('', '') not in choices:
-                            choices = [('', '')] + list(choices)
-                        field.choices = choices
-        bulk_form = BulkForm
+    if bulk_form and request.method == 'POST' and bulk_form.is_valid():
+        return bulk_form.save()
 
     if bulk_form:
-        if request.method == 'POST':
-            pks = [key[len('pk_'):] for key in request.POST if key.startswith('pk_')]
-
-            f = bulk_form(request.POST)
-            if f.is_valid():
-                table.data \
-                    .filter(pk__in=pks) \
-                    .filter(**table.Meta.bulk_filter) \
-                    .exclude(**table.Meta.bulk_exclude) \
-                    .update(**{k: v for k, v in f.cleaned_data.items() if v is not None and v is not ''})
-
-            return HttpResponseRedirect(request.META['HTTP_REFERER'])
-        else:
-            context['bulk_form'] = bulk_form()
+        context['bulk_form'] = bulk_form
 
     context = object_list_context(request,
                                   table=table,
